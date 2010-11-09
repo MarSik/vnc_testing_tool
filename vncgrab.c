@@ -103,9 +103,13 @@ struct GVncCapture {
 	int port;
 
 	gboolean quiet;
-	gboolean saved;
+
+	gboolean record;
+	unsigned long counter;
+	unsigned int analysis;
 
 	VncConnection *conn;
+	gboolean nohup;
         GMainLoop *loop;
 	GIOChannel *stdin;
 	gboolean connected;
@@ -187,31 +191,47 @@ void do_exit(struct GVncCapture *capture)
 	g_main_quit(capture->loop);
 }
 
+void saveCapture(struct GVncCapture *capture);
+
 static void do_vnc_framebuffer_update(VncConnection *conn,
 				      guint16 x, guint16 y,
 				      guint16 width, guint16 height,
 				      gpointer opaque)
 {
-	static int counter = 0;
 	struct GVncCapture *capture = opaque;
-	char* filename;
 
 	if (!capture->pixbuf)
 		return;
 
+	VNC_DEBUG("Display change +%d+%d-%dx%d pixels", x, y, width, height);
+
 	/* do not save small changes */
-	//if (width*height<30)
-	//	return;
+	if (!capture->record/* || width*height<30*/)
+		return;
 
+	saveCapture(capture);
+}
 
-	if (asprintf(&filename, "%s-%dy.png", capture->output, counter)) {
-		VNC_DEBUG("Saving %s", filename, x, y, width, height);
+void saveCapture(struct GVncCapture *capture)
+{
+	char* filename;
+
+	if (asprintf(&filename, "%s-%dy.png", capture->output, capture->counter)) {
+		VNC_DEBUG("Saving %s", filename);
 
 		// Grayscale image
 		IplImage *gray = cvCreateImage(
 				cvSize(capture->pixbuf->width, capture->pixbuf->height),
 				IPL_DEPTH_8U, 1);
 		cvCvtColor(capture->pixbuf, gray, CV_RGBA2GRAY);
+		if (capture->analysis & 1)
+			cvAdaptiveThreshold(gray, gray, 255, CV_ADAPTIVE_THRESH_GAUSSIAN_C, CV_THRESH_BINARY, 3, 3);
+
+		if (capture->analysis & 2)
+			cvEqualizeHist(gray, gray);
+
+		if (capture->analysis & 4)
+			cvThreshold(gray, gray, 240, 255, CV_THRESH_BINARY);
 
 		// RGB image
 		IplImage *tmp = cvCreateImage(
@@ -234,6 +254,19 @@ static void do_vnc_framebuffer_update(VncConnection *conn,
 		cvSaveImage(filename, sobel, NULL);
 
 		xchar = strrchr(filename, 'x');
+		*xchar = 'e';
+
+		IplImage *canny = cvCreateImage(
+				cvSize(capture->pixbuf->width, capture->pixbuf->height),
+				IPL_DEPTH_8U, 1);
+
+#define CANNYH 64
+#define CANNYL 8
+
+		cvCanny(gray, canny, CANNYL, CANNYH, 3);
+		cvSaveImage(filename, canny, NULL);
+
+		xchar = strrchr(filename, 'e');
 		*xchar = 'o';
 
 		cvSaveImage(filename, tmp, NULL);
@@ -243,11 +276,12 @@ static void do_vnc_framebuffer_update(VncConnection *conn,
 
 		cvSaveImage(filename, gray, NULL);
 
+		cvReleaseImage(&canny);
 		cvReleaseImage(&sobel);
 		cvReleaseImage(&gray);
 		cvReleaseImage(&tmp);
 		free(filename);
-		counter++;
+		capture->counter++;
 	}
 }
 
@@ -304,8 +338,6 @@ static void do_vnc_desktop_resize(VncConnection *conn,
 	CvSize size = cvSize(width, height);
 	capture->pixbuf = cvCreateImage(size, IPL_DEPTH_8U, 4);
 	cvSetZero(capture->pixbuf);
-	//memset(capture->pixbuf->imageData, 0xFF,
-	//	capture->pixbuf->widthStep * capture->pixbuf->height);
 
 	VNC_DEBUG("Backplane %dbx%d %d per line [used %d]\n",
 		  capture->pixbuf->depth,
@@ -329,11 +361,11 @@ static void do_vnc_initialized(VncConnection *conn,
 			       gpointer opaque)
 {
 	struct GVncCapture *capture = opaque;
-	gint32 encodings[] = {  //VNC_CONNECTION_ENCODING_DESKTOP_RESIZE,
-                                //VNC_CONNECTION_ENCODING_ZRLE,
-				//VNC_CONNECTION_ENCODING_HEXTILE,
-				//VNC_CONNECTION_ENCODING_RRE,
-				//VNC_CONNECTION_ENCODING_COPY_RECT,
+	gint32 encodings[] = {  VNC_CONNECTION_ENCODING_DESKTOP_RESIZE,
+                                VNC_CONNECTION_ENCODING_ZRLE,
+				VNC_CONNECTION_ENCODING_HEXTILE,
+				VNC_CONNECTION_ENCODING_RRE,
+				VNC_CONNECTION_ENCODING_COPY_RECT,
 				VNC_CONNECTION_ENCODING_RAW };
 	gint32 *encodingsp;
 	int n_encodings;
@@ -509,12 +541,32 @@ static gboolean do_stdin_input(GIOChannel *source,
 		return TRUE;
 	
 	/* EOF or error */
-	else if (status == G_IO_STATUS_ERROR ||
-		 status == G_IO_STATUS_EOF)
+	else if (status == G_IO_STATUS_ERROR)
 		return FALSE;
+	else if (status == G_IO_STATUS_EOF) {
+		if (!capture->nohup) do_exit(capture);
+		return FALSE;
+	}
 	
 	/* Process the line */ 
 	fprintf(stderr, "IN> %s\n", line);
+
+	if (!strcmp("record\n", line))
+		capture->record = TRUE;
+	else if (!strcmp("stop\n", line))
+		capture->record = FALSE;
+	else if (!strcmp("save\n", line))
+		saveCapture(capture);
+	else if (!strcmp("adaptive\n", line))
+		capture->analysis |= 1;
+	else if (!strcmp("expand\n", line))
+		capture->analysis |= 2;
+	else if (!strcmp("treshold\n", line))
+		capture->analysis |= 4;
+	else if (!strcmp("reset\n", line))
+		capture->analysis |= 0;
+	else if (!strcmp("nohup\n", line))
+		capture->nohup = TRUE;
 
 	/* Free the line */
 	g_free(line);
@@ -578,6 +630,7 @@ int main(int argc, char **argv)
 	port = g_strdup_printf("%d", capture->port);
 
 	capture->conn = vnc_connection_new();
+	vnc_connection_set_shared(capture->conn, TRUE);
 	capture->output = g_strdup(args[1]);
 
 	g_signal_connect(capture->conn, "vnc-initialized",
@@ -618,7 +671,7 @@ int main(int argc, char **argv)
 	if (capture->pixbuf)
 		cvReleaseImage(&(capture->pixbuf));
 
-	ret = capture->saved ? 0 : 1;
+	ret = 0;
 
 	g_free(capture->host);
 	g_free(capture);
