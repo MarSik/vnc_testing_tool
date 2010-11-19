@@ -105,6 +105,7 @@ struct GVncCapture {
 	gboolean quiet;
 
 	gboolean record;
+        gboolean overwrite;
 	unsigned long counter;
 	unsigned int analysis;
 
@@ -205,11 +206,18 @@ static void do_vnc_framebuffer_update(VncConnection *conn,
 
 	VNC_DEBUG("Display change +%d+%d-%dx%d pixels", x, y, width, height);
 
-	/* do not save small changes */
-	if (!capture->record/* || width*height<30*/)
-		return;
 
-	saveCapture(capture);
+	/* do not save small changes */
+	if (capture->record && width*height>30*30)
+		saveCapture(capture);
+
+        /* request another update */
+	vnc_connection_framebuffer_update_request(capture->conn,
+                                                  TRUE,
+                                                  0, 0,
+                                                  vnc_connection_get_width(capture->conn),
+                                                  vnc_connection_get_height(capture->conn));
+
 }
 
 void saveCapture(struct GVncCapture *capture)
@@ -232,6 +240,9 @@ void saveCapture(struct GVncCapture *capture)
 
 		if (capture->analysis & 4)
 			cvThreshold(gray, gray, 240, 255, CV_THRESH_BINARY);
+
+		if (capture->analysis & 8)
+			cvNot(gray, gray);
 
 		// RGB image
 		IplImage *tmp = cvCreateImage(
@@ -281,7 +292,7 @@ void saveCapture(struct GVncCapture *capture)
 		cvReleaseImage(&gray);
 		cvReleaseImage(&tmp);
 		free(filename);
-		capture->counter++;
+		if(!capture->overwrite) capture->counter++;
 	}
 }
 
@@ -384,7 +395,8 @@ static void do_vnc_initialized(VncConnection *conn,
 
 	VNC_DEBUG("Requesting first framebuffer update");
 	if (!vnc_connection_framebuffer_update_request(capture->conn,
-						       0, 0, 0,
+						       TRUE,
+                                                       0, 0,
 						       vnc_connection_get_width(capture->conn),
 						       vnc_connection_get_height(capture->conn)))
 		vnc_connection_shutdown(capture->conn);
@@ -518,6 +530,16 @@ static gboolean vnc_debug_option_arg(const gchar *option_name G_GNUC_UNUSED,
 	return TRUE;
 }
 
+void do_send_string(struct GVncCapture *capture, const char* string)
+{
+        const char *chr = string;
+        while(*chr){
+                vnc_connection_key_event(capture->conn, TRUE, *chr, 0);
+                vnc_connection_key_event(capture->conn, FALSE, *chr, 0);
+                chr++;
+        }
+}
+
 static gboolean do_stdin_input(GIOChannel *source,
 			       GIOCondition cond,
 			       gpointer data)
@@ -549,7 +571,7 @@ static gboolean do_stdin_input(GIOChannel *source,
 	}
 	
 	/* Process the line */ 
-	fprintf(stderr, "IN> %s\n", line);
+	VNC_DEBUG("IN> %s\n", line);
 
 	if (!strcmp("record\n", line))
 		capture->record = TRUE;
@@ -563,10 +585,28 @@ static gboolean do_stdin_input(GIOChannel *source,
 		capture->analysis |= 2;
 	else if (!strcmp("treshold\n", line))
 		capture->analysis |= 4;
+	else if (!strcmp("invert\n", line))
+		capture->analysis |= 8;
 	else if (!strcmp("reset\n", line))
-		capture->analysis |= 0;
+		capture->analysis = 0;
 	else if (!strcmp("nohup\n", line))
 		capture->nohup = TRUE;
+	else if (!strcmp("overwrite\n", line))
+		capture->overwrite = TRUE;
+	else if (!strncmp("m ", line, 2)) {
+                unsigned x, y;
+                unsigned buttons;
+                if(sscanf(line+2, "%u %u %u", &x, &y, &buttons)>=2){
+                        vnc_connection_pointer_event(capture->conn, buttons, x, y);
+                }
+                else fprintf(stderr, "Bad format of mouse event: %s", line+2);
+        }
+	else if (!strncmp("k ", line, 2)) {
+                int l = strlen(line);
+                line[l] = '\0';
+                do_send_string(capture, line+2);
+        }
+        else fprintf(stderr, "Unknown command: %s", line);
 
 	/* Free the line */
 	g_free(line);
